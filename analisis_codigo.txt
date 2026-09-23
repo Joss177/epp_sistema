@@ -1,0 +1,1022 @@
+EN ESTE ARCHIVO SE # CONFIGURACIÓN TODA LA INFORMACIÓN DE CODIGO PARA APLICAR INGENIERIA INVERSA,
+SE ELIMINO TODO RASTRO DE APIS KEY, CONTRASEÑA DE USUARIOS, URLs, NUMEROS TELEFONICOS, NOMBRE Y IP DE CAMARAS.
+
+===== ppe-detector/src/alert_manager.py =====
+"""
+Gestión de alertas: cooldown para no saturar WhatsApp, guardado de evidencia
+en disco, registro en base de datos SQLite, y envío por GreenAPI.
+"""
+
+import cv2
+import requests
+import sqlite3
+import time
+import os
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+class AlertManager:
+    def __init__(self, greenapi_config, storage_config, cooldown_minutes: int = 3):
+        self.id_instance = greenapi_config["id_instance"]
+        self.api_token = greenapi_config["api_token_instance"]
+        self.chat_id = greenapi_config["chat_id"]
+
+        self.snapshots_dir = storage_config["snapshots_dir"]
+        self.db_path = storage_config["database_path"]
+        self.cooldown_seconds = cooldown_minutes * 60
+
+        os.makedirs(self.snapshots_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+        self._last_alert_time = {}  # camera_id -> timestamp del último aviso
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS eventos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                camara_id TEXT NOT NULL,
+                epp_faltante TEXT NOT NULL,
+                fecha_hora TEXT NOT NULL,
+                snapshot_path TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _en_cooldown(self, camera_id: str) -> bool:
+        ultimo = self._last_alert_time.get(camera_id, 0)
+        return (time.time() - ultimo) < self.cooldown_seconds
+
+    def _guardar_snapshot(self, camera_id: str, frame) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{camera_id}_{timestamp}.jpg"
+        filepath = os.path.join(self.snapshots_dir, filename)
+        cv2.imwrite(filepath, frame)
+        return filepath
+
+    def _registrar_evento(self, camera_id: str, epp_faltante: list, snapshot_path: str):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO eventos (camara_id, epp_faltante, fecha_hora, snapshot_path) VALUES (?, ?, ?, ?)",
+            (camera_id, ", ".join(epp_faltante), datetime.now().isoformat(), snapshot_path),
+        )
+        conn.commit()
+        conn.close()
+
+    def _enviar_whatsapp(self, mensaje: str, snapshot_path: str):
+        url = f"https://api.greenapi.com/waInstance{self.id_instance}/sendFileByUpload/{self.api_token}"
+
+        with open(snapshot_path, "rb") as f:
+            files = {"file": (os.path.basename(snapshot_path), f, "image/jpeg")}
+            data = {"chatId": self.chat_id, "caption": mensaje}
+            try:
+                response = requests.post(url, data=data, files=files, timeout=15)
+                response.raise_for_status()
+                logger.info(f"Alerta enviada por WhatsApp: {response.status_code}")
+            except requests.RequestException as e:
+                logger.error(f"Error enviando alerta a GreenAPI: {e}")
+
+    def procesar_incumplimiento(self, camera_id: str, epp_faltante: list, frame):
+        """
+        Punto de entrada principal: decide si corresponde alertar (respetando
+        cooldown), guarda evidencia, registra el evento y notifica por WhatsApp.
+        """
+        if self._en_cooldown(camera_id):
+            return
+
+        snapshot_path = self._guardar_snapshot(camera_id, frame)
+        self._registrar_evento(camera_id, epp_faltante, snapshot_path)
+
+        mensaje = (
+            f"⚠️ *Alerta de EPP incompleto*\n"
+            f"Cámara: {camera_id}\n"
+            f"Falta: {', '.join(epp_faltante)}\n"
+            f"Hora: {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
+        )
+        self._enviar_whatsapp(mensaje, snapshot_path)
+
+        self._last_alert_time[camera_id] = time.time()
+
+===== ppe-detector/src/camera_stream.py =====
+"""
+Lectura de cámara RTSP en un hilo separado.
+
+Por qué un hilo aparte: OpenCV va llenando un buffer interno con frames de la
+cámara. Si tu CPU tarda en procesar cada frame (por el modelo de detección),
+el buffer se acumula y terminas viendo/analizando video "atrasado" respecto
+al tiempo real. Con un hilo dedicado a leer, siempre nos quedamos con el
+frame MÁS RECIENTE y descartamos los viejos.
+"""
+
+import cv2
+import threading
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class CameraStream:
+    def __init__(self, camera_id: str, rtsp_url: str, reconnect_delay: int = 5):
+        self.camera_id = camera_id
+        self.rtsp_url = rtsp_url
+        self.reconnect_delay = reconnect_delay
+
+        self.capture = None
+        self.latest_frame = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._update_loop, daemon=True)
+        self.thread.start()
+        logger.info(f"[{self.camera_id}] Hilo de captura iniciado")
+        return self
+
+    def _connect(self):
+        capture = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        # Buffer chico: minimiza el delay entre lo que pasa y lo que vemos
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return capture
+
+    def _update_loop(self):
+        self.capture = self._connect()
+
+        while self.running:
+            if self.capture is None or not self.capture.isOpened():
+                logger.warning(f"[{self.camera_id}] Sin conexión, reintentando en {self.reconnect_delay}s...")
+                time.sleep(self.reconnect_delay)
+                self.capture = self._connect()
+                continue
+
+            ok, frame = self.capture.read()
+            if not ok:
+                logger.warning(f"[{self.camera_id}] Frame no leído, reconectando...")
+                self.capture.release()
+                self.capture = None
+                time.sleep(self.reconnect_delay)
+                continue
+
+            with self.lock:
+                self.latest_frame = frame
+
+    def read(self):
+        """Devuelve el frame más reciente disponible (o None si aún no hay ninguno)."""
+        with self.lock:
+            return None if self.latest_frame is None else self.latest_frame.copy()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+        if self.capture:
+            self.capture.release()
+        logger.info(f"[{self.camera_id}] Detenido")
+
+===== ppe-detector/src/main.py =====
+"""
+Orquestador principal: lee cámaras, corre detección de EPP, y dispara
+alertas cuando corresponde.
+
+Uso:
+    python src/main.py
+"""
+
+import yaml
+import time
+import logging
+from collections import defaultdict
+
+from camera_stream import CameraStream
+from ppe_detector import PPEDetector
+from alert_manager import AlertManager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def cargar_config(path="config.yaml"):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def main():
+    config = cargar_config()
+
+    # --- Iniciar cámaras ---
+    streams = {}
+    for cam_cfg in config["cameras"]:
+        stream = CameraStream(cam_cfg["id"], cam_cfg["rtsp_url"]).start()
+        streams[cam_cfg["id"]] = stream
+
+    # --- Cargar detector ---
+    det_cfg = config["detection"]
+    detector = PPEDetector(
+        model_path=det_cfg["model_path"],
+        confidence_threshold=det_cfg["confidence_threshold"],
+        resize_width=det_cfg["resize_width"],
+    )
+
+    # --- Gestor de alertas ---
+    alert_manager = AlertManager(
+        greenapi_config=config["greenapi"],
+        storage_config=config["storage"],
+        cooldown_minutes=det_cfg["alert_cooldown_minutes"],
+    )
+
+    frame_skip = det_cfg["frame_skip"]
+    seconds_before_alert = det_cfg["seconds_before_alert"]
+    required_ppe = det_cfg["required_ppe"]
+
+    # Trackea desde cuándo cada cámara viene detectando incumplimiento sostenido
+    incumplimiento_desde = defaultdict(lambda: None)
+
+    logger.info("Sistema iniciado. Esperando frames de las cámaras...")
+
+    frame_counter = 0
+    try:
+        while True:
+            frame_counter += 1
+            time.sleep(0.1)  # ritmo del loop principal
+
+            if frame_counter % frame_skip != 0:
+                continue
+
+            for camera_id, stream in streams.items():
+                frame = stream.read()
+                if frame is None:
+                    continue  # cámara aún conectando
+
+                detections = detector.detect(frame)
+                faltante = detector.evaluar_cumplimiento(detections, required_ppe)
+
+                if faltante:
+                    if incumplimiento_desde[camera_id] is None:
+                        incumplimiento_desde[camera_id] = time.time()
+
+                    tiempo_incumpliendo = time.time() - incumplimiento_desde[camera_id]
+                    if tiempo_incumpliendo >= seconds_before_alert:
+                        logger.warning(f"[{camera_id}] EPP incompleto sostenido: {faltante}")
+                        alert_manager.procesar_incumplimiento(camera_id, faltante, frame)
+                        incumplimiento_desde[camera_id] = None  # reinicia el contador tras alertar
+                else:
+                    incumplimiento_desde[camera_id] = None  # se cumplió, reinicia
+
+    except KeyboardInterrupt:
+        logger.info("Deteniendo sistema...")
+    finally:
+        for stream in streams.values():
+            stream.stop()
+
+
+if __name__ == "__main__":
+    main()
+
+===== ppe-detector/src/ppe_detector.py =====
+"""
+Detección de personas y EPP (casco, botas, guantes) usando YOLO.
+
+IMPORTANTE: el modelo YOLO estándar (entrenado con COCO) NO detecta cascos,
+botas ni guantes — solo detecta "person" y objetos genéricos. Para que esto
+funcione necesitas un modelo entrenado específicamente para EPP (ver README,
+sección "Conseguir un modelo de EPP").
+
+Este módulo asume que tu modelo .pt tiene clases con nombres como:
+  "casco", "sin_casco", "botas", "sin_botas", "guantes", "sin_guantes"
+(o en inglés: "helmet", "no_helmet", "boots", "gloves", etc.)
+
+Ajusta CLASS_NAME_MAP abajo según las clases reales de tu modelo.
+"""
+
+from ultralytics import YOLO
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Mapea el nombre de clase que devuelve TU modelo -> nombre estándar interno.
+# Edita esto según lo que imprima `model.names` (ver comentario al final del archivo).
+CLASS_NAME_MAP = {
+    "helmet": "casco",
+    "no_helmet": "sin_casco",
+    "boots": "botas",
+    "no_boots": "sin_botas",
+    "gloves": "guantes",
+    "no_gloves": "sin_guantes",
+    "person": "persona",
+}
+
+
+class PPEDetector:
+    def __init__(self, model_path: str, confidence_threshold: float = 0.5, resize_width: int = 640):
+        logger.info(f"Cargando modelo desde {model_path}...")
+        self.model = YOLO(model_path)
+        self.confidence_threshold = confidence_threshold
+        self.resize_width = resize_width
+        logger.info(f"Modelo cargado. Clases disponibles: {self.model.names}")
+
+    def detect(self, frame):
+        """
+        Corre la detección sobre un frame.
+        Devuelve una lista de detecciones: [{"clase": str, "confianza": float, "box": (x1,y1,x2,y2)}, ...]
+        """
+        # Reescalar para acelerar inferencia en CPU
+        h, w = frame.shape[:2]
+        if w > self.resize_width:
+            scale = self.resize_width / w
+            frame = cv2_resize(frame, self.resize_width, int(h * scale))
+
+        results = self.model.predict(
+            frame,
+            conf=self.confidence_threshold,
+            verbose=False,
+            device="cpu",
+        )
+
+        detections = []
+        for result in results:
+            for box in result.boxes:
+                class_id = int(box.cls[0])
+                raw_name = self.model.names[class_id]
+                mapped_name = CLASS_NAME_MAP.get(raw_name, raw_name)
+                confidence = float(box.conf[0])
+                xyxy = box.xyxy[0].tolist()
+                detections.append({
+                    "clase": mapped_name,
+                    "confianza": confidence,
+                    "box": xyxy,
+                })
+
+        return detections
+
+    def evaluar_cumplimiento(self, detections, required_ppe):
+        """
+        A partir de las detecciones de un frame, determina qué EPP requerido
+        NO fue detectado. Devuelve una lista de EPP faltante, ej: ["botas", "guantes"]
+
+        Nota: esta es una versión simple que asume una persona por frame.
+        Si necesitas trackear múltiples personas por separado en el mismo
+        frame, hay que agregar asociación de boxes por persona (te ayudo si
+        llegas a necesitarlo).
+        """
+        clases_detectadas = {d["clase"] for d in detections}
+        faltante = [item for item in required_ppe if item not in clases_detectadas]
+        return faltante
+
+
+def cv2_resize(frame, width, height):
+    import cv2
+    return cv2.resize(frame, (width, height))
+
+===== ppe-detector/config.yaml =====
+# ============================================================
+# CONFIGURACIÓN - Detección de EPP Cervecería Pacífico
+# ============================================================
+
+cameras:
+  - id: "entrada_planta"
+    # Formato TP-Link Tapo/VIGI: rtsp://usuario:password@IP:elimine/stream1
+    # stream1 = HD (mas pesado) | stream2 = SD (mas liviano, recomendado sin GPU)
+    rtsp_url: "rtsp://usuario:password@elimine/stream2"
+
+  - id: "linea_embotellado"
+    rtsp_url: "rtsp://usuario:password@elimine/stream2"
+
+  # - id: "camara_3"
+  #   rtsp_url: "rtsp://usuario:password@elimine/stream2"
+
+detection:
+  # Ruta al modelo YOLO (.pt). Ver README para dónde conseguir uno de EPP.
+  model_path: "models/ppe_model.pt"
+
+  # Confianza mínima para considerar válida una detección (0.0 - 1.0)
+  confidence_threshold: 0.5
+
+  # Analizar 1 de cada N frames (baja carga de CPU). Con CPU sin GPU, 10-15 es razonable.
+  frame_skip: 10
+
+  # Ancho al que se reescala el frame antes de analizarlo (más chico = más rápido)
+  resize_width: 640
+
+  # EPP obligatorio a verificar. Deben coincidir con los nombres de clase que
+  # detecte tu modelo (ver README para ajustar según tu dataset).
+  required_ppe:
+    - "casco"
+    - "botas"
+    - "guantes"
+
+  # Segundos que debe persistir la falta de EPP antes de generar una alerta
+  # (evita falsas alertas por un frame borroso o mala visibilidad momentánea)
+  seconds_before_alert: 5
+
+  # Minutos de espera antes de volver a alertar por la misma persona/zona
+  alert_cooldown_minutes: 3
+
+greenapi:
+  id_instance: "TU_ID_INSTANCE_AQUI"
+  api_token_instance: "TU_API_TOKEN_AQUI"
+  # Número o grupo de WhatsApp destino, formato: 521XXXXXXXXXX@c.us (número) o XXXXXXXXX@g.us (grupo)
+  chat_id: "521XXXXXXXXXX@c.us"
+
+storage:
+  # Dónde se guardan las evidencias (fotos) y el registro de eventos
+  snapshots_dir: "data/snapshots"
+  database_path: "data/events.db"
+
+===== ppe-detector/requirements.txt =====
+ultralytics==8.3.0
+opencv-python==4.10.0.84
+requests==2.32.3
+PyYAML==6.0.2
+
+===== eppcamaras.py =====
+# epp_camaras_ip.py
+import cv2
+import time
+import datetime
+import os
+import glob
+import requests
+import threading
+from inference_sdk import InferenceHTTPClient
+
+# ──────────────────────────────────────────
+# CONFIGURACIÓN
+# ──────────────────────────────────────────
+COOLDOWN_SEG      = 300              # 5 minutos entre alertas
+CARPETA_SS        = "capturas"
+CARPETA_VIDEO     = "grabaciones"
+MINUTOS_POR_VIDEO = 60
+DIAS_RETENCION    = 7
+
+GREEN_ID_INSTANCE = "710722699428"
+GREEN_API_TOKEN   = "7575dcf2d14b4ca0b719c0afaede080afcb3889da1ba4f1fbd"
+GREEN_API_URL     = "https://7107.api.greenapi.com/waInstance" + GREEN_ID_INSTANCE
+TELEFONO          = "5218711968778"
+
+# ── Define aquí tus cámaras IP ──────────────
+# Formato: rtsp://usuario:contraseña@IP:puerto/ruta
+CAMARAS = [
+    {"id": "CAM-01", "nombre": "Pasillo",   "url": "rtsp://MantoGral:elimine"},
+    {"id": "CAM-02", "nombre": "Camra 2",   "url": "rtsp://MantoGral:eilimin"}
+]
+ 
+EPP_REQUERIDO = {
+    "hardhat": "Casco",
+    "gloves":  "Guantes",
+    "goggles": "Careta",
+}
+
+# Umbral de confianza por clase
+CONFIANZA_POR_CLASE = {
+    "hardhat": 0.5,
+    "gloves":  0.25,
+    "goggles": 0.20,
+}
+
+CLIENT = InferenceHTTPClient(
+    api_url="elimine URL",
+    api_key="elimine api key"
+)
+MODEL_ID = "personal-protective-equipment-combined-model/8"
+
+# ──────────────────────────────────────────
+# INICIALIZACIÓN
+# ──────────────────────────────────────────
+os.makedirs(CARPETA_SS,    exist_ok=True)
+os.makedirs(CARPETA_VIDEO, exist_ok=True)
+
+lock_ws     = threading.Lock()
+ultimo_envio = {}
+
+# ──────────────────────────────────────────
+# FUNCIONES
+# ──────────────────────────────────────────
+def nuevo_video_writer(cam_id, resolucion):
+    ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path   = CARPETA_VIDEO + "/" + cam_id + "_" + ts + ".avi"
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    w, h   = resolucion
+    writer = cv2.VideoWriter(path, fourcc, 20.0, (w, h))
+    print("[" + cam_id + "] Nueva grabacion: " + path)
+    return writer, time.time()
+
+def limpiar_grabaciones_viejas():
+    ahora  = time.time()
+    limite = DIAS_RETENCION * 86400
+    for archivo in glob.glob(CARPETA_VIDEO + "/*.avi"):
+        if ahora - os.path.getmtime(archivo) > limite:
+            os.remove(archivo)
+            print("Grabacion eliminada: " + archivo)
+
+def tomar_screenshot(cam_id, frame):
+    ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    nombre = CARPETA_SS + "/" + cam_id + "_alerta_" + ts + ".png"
+    cv2.imwrite(nombre, frame)
+    print("[" + cam_id + "] Screenshot: " + nombre)
+    return nombre
+
+def enviar_mensaje_whatsapp(cam_id, mensaje):
+    try:
+        url  = GREEN_API_URL + "/sendMessage/" + GREEN_API_TOKEN
+        body = {"chatId": TELEFONO + "@c.us", "message": mensaje}
+        r = requests.post(url, json=body, timeout=10)
+        if r.status_code == 200:
+            print("[" + cam_id + "] Mensaje enviado.")
+        else:
+            print("[" + cam_id + "] Error mensaje: " + str(r.status_code))
+    except Exception as e:
+        print("[" + cam_id + "] Error: " + str(e))
+
+def enviar_imagen_whatsapp(cam_id, ruta_imagen):
+    try:
+        url  = GREEN_API_URL + "/sendFileByUpload/" + GREEN_API_TOKEN
+        body = {"chatId": TELEFONO + "@c.us", "caption": "[" + cam_id + "] Captura del incidente"}
+        with open(ruta_imagen, "rb") as f:
+            files = {"file": (os.path.basename(ruta_imagen), f, "image/png")}
+            r = requests.post(url, data=body, files=files, timeout=15)
+        if r.status_code == 200:
+            print("[" + cam_id + "] Imagen enviada.")
+        else:
+            print("[" + cam_id + "] Error imagen: " + str(r.status_code))
+    except Exception as e:
+        print("[" + cam_id + "] Error imagen: " + str(e))
+
+def enviar_alerta(cam_id, cam_nombre, mensaje, ruta_imagen):
+    with lock_ws:
+        enviar_mensaje_whatsapp(cam_id, mensaje)
+        time.sleep(3)
+        enviar_imagen_whatsapp(cam_id, ruta_imagen)
+
+def detectar_faltantes(preds):
+    detectados = set()
+    for pred in preds:
+        clase   = pred["class"].lower()
+        umbral  = CONFIANZA_POR_CLASE.get(clase, 0.3)
+        if pred["confidence"] >= umbral:
+            detectados.add(clase)
+    return [nombre for clave, nombre in EPP_REQUERIDO.items()
+            if clave not in detectados]
+
+def dibujar_ui(frame, preds, faltantes, cam_nombre):
+    # Bounding boxes
+    for pred in preds:
+        clase  = pred["class"].lower()
+        umbral = CONFIANZA_POR_CLASE.get(clase, 0.3)
+        if pred["confidence"] < umbral:
+            continue
+        x = int(pred["x"] - pred["width"]  / 2)
+        y = int(pred["y"] - pred["height"] / 2)
+        w = int(pred["width"])
+        h = int(pred["height"])
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 200, 0), 2)
+        cv2.putText(frame, pred["class"] + " " + str(round(pred["confidence"]*100)) + "%",
+                    (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2)
+
+    # Panel EPP
+    fondo_h = len(EPP_REQUERIDO) * 30 + 10
+    cv2.rectangle(frame, (0, 0), (220, fondo_h), (30, 30, 30), -1)
+    for i, (clave, nombre) in enumerate(EPP_REQUERIDO.items()):
+        ok    = nombre not in faltantes
+        color = (0, 220, 0) if ok else (0, 60, 220)
+        icono = "OK" if ok else "!!"
+        cv2.putText(frame, "[" + icono + "] " + nombre,
+                    (8, 25 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+    # Nombre de camara
+    h_frame, w_frame = frame.shape[:2]
+    cv2.rectangle(frame, (w_frame - 240, 0), (w_frame, 30), (30, 30, 30), -1)
+    cv2.putText(frame, cam_nombre, (w_frame - 235, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2)
+
+    # Timestamp
+    ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    cv2.putText(frame, ts, (10, h_frame - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+    # Barra roja
+    if faltantes:
+        cv2.rectangle(frame, (0, h_frame - 45), (w_frame, h_frame - 25), (0, 0, 180), -1)
+        cv2.putText(frame, "FALTA: " + ", ".join(faltantes),
+                    (10, h_frame - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+    return frame
+
+# ──────────────────────────────────────────
+# HILO POR CAMARA
+# ──────────────────────────────────────────
+def procesar_camara(camara):
+    cam_id     = camara["id"]
+    cam_nombre = camara["nombre"]
+    cam_url    = camara["url"]
+
+    print("[" + cam_id + "] Conectando a " + cam_url + "...")
+    cap = cv2.VideoCapture(cam_url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(7,0)
+
+    if not cap.isOpened():
+        print("[" + cam_id + "] No se pudo conectar. Verifica IP, usuario y contrasena.")
+        return
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if w == 0 or h == 0:
+        w, h = 1280, 720
+
+    print("[" + cam_id + "] Conectado — " + cam_nombre + " (" + str(w) + "x" + str(h) + ")")
+
+    out, tiempo_inicio_video = nuevo_video_writer(cam_id, (w, h))
+    limpiar_grabaciones_viejas()
+
+    predicciones = []
+    faltantes    = []
+    frame_count  = 0
+    reintentos   = 0
+    ventana      = "EPP | " + cam_id + " - " + cam_nombre
+
+    while True:
+        ret, frame = cap.read()
+
+        if not ret:
+            reintentos += 1
+            print("[" + cam_id + "] Frame perdido (intento " + str(reintentos) + "). Reconectando...")
+            cap.release()
+            time.sleep(3)
+            cap = cv2.VideoCapture(cam_url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if reintentos >= 10:
+                print("[" + cam_id + "] Demasiados fallos. Hilo detenido.")
+                break
+            continue
+
+        reintentos  = 0
+        frame_count += 1
+
+        # API cada 10 frames
+        if frame_count % 10 == 0:
+            try:
+                temp_path = CARPETA_SS + "/" + cam_id + "_temp.jpg"
+                cv2.imwrite(temp_path, frame)
+                resultado    = CLIENT.infer(temp_path, model_id=MODEL_ID)
+                predicciones = resultado.get("predictions", [])
+                faltantes    = detectar_faltantes(predicciones)
+            except Exception as e:
+                print("[" + cam_id + "] Error API: " + str(e))
+                predicciones = []
+                faltantes    = []
+
+        frame = dibujar_ui(frame, predicciones, faltantes, cam_nombre)
+        out.write(frame)
+
+        # Partir video
+        if time.time() - tiempo_inicio_video >= MINUTOS_POR_VIDEO * 60:
+            out.release()
+            out, tiempo_inicio_video = nuevo_video_writer(cam_id, (w, h))
+            limpiar_grabaciones_viejas()
+
+        cv2.imshow(ventana, frame)
+
+        # Alerta
+        if faltantes:
+            clave_alerta = cam_id + "_" + "_".join(sorted(faltantes))
+            ahora        = time.time()
+            if ahora - ultimo_envio.get(clave_alerta, 0) >= COOLDOWN_SEG:
+                ultimo_envio[clave_alerta] = ahora
+                ts      = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                mensaje = (
+                    "ALERTA SEGURIDAD - EPP INCOMPLETO\n"
+                    "Ubicacion: " + cam_nombre + " (" + cam_id + ")\n"
+                    "Hora: " + ts + "\n"
+                    "Faltante(s): " + ", ".join(faltantes) + "\n"
+                    "Por favor equipese antes de continuar."
+                )
+                ruta = tomar_screenshot(cam_id, frame)
+                threading.Thread(
+                    target=enviar_alerta,
+                    args=(cam_id, cam_nombre, mensaje, ruta),
+                    daemon=True
+                ).start()
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    out.release()
+    cv2.destroyWindow(ventana)
+    print("[" + cam_id + "] Hilo detenido.")
+
+# ──────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────
+if __name__ == "__main__":
+    print("Sistema EPP IP iniciado - " + str(len(CAMARAS)) + " camara(s).")
+    hilos = []
+    for camara in CAMARAS:
+        hilo = threading.Thread(
+            target=procesar_camara,
+            args=(camara,),
+            daemon=True,
+            name=camara["id"]
+        )
+        hilo.start()
+        hilos.append(hilo)
+
+    for hilo in hilos:
+        hilo.join()
+
+    cv2.destroyAllWindows()
+    print("Sistema detenido.")
+===== epp_laptop.py =====
+# epp_laptop.py
+import cv2
+import time
+import datetime
+import os
+import requests
+from inference_sdk import InferenceHTTPClient
+
+# ──────────────────────────────────────────
+# CONFIGURACIÓN
+# ──────────────────────────────────────────
+TELEFONO          = "ELIMNADO"
+COOLDOWN_SEG      = 30
+CARPETA_SS        = "capturas"
+CARPETA_VIDEO     = "grabaciones"
+MINUTOS_POR_VIDEO = 60
+DIAS_RETENCION    = 7
+
+GREEN_ID_INSTANCE = "ELIMINADO"
+GREEN_API_TOKEN   = "ELIMINADO"
+GREEN_API_URL     = "ELIMINADO" + GREEN_ID_INSTANCE
+
+EPP_REQUERIDO = {
+    "hardhat": "Casco",
+    "gloves":  "Guantes",
+    "goggles": "Careta",
+}
+
+CLIENT = InferenceHTTPClient(
+    api_url="https://serverless.roboflow.com",
+    api_key="38fcYXkYXgGJmJgZsYZa"
+)
+
+MODEL_ID = "personal-protective-equipment-combined-model/8"
+
+# ──────────────────────────────────────────
+# INICIALIZACIÓN
+# ──────────────────────────────────────────
+os.makedirs(CARPETA_SS,    exist_ok=True)
+os.makedirs(CARPETA_VIDEO, exist_ok=True)
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+if not cap.isOpened():
+    raise RuntimeError("No se pudo abrir la camara.")
+
+ultimo_envio = {}
+predicciones = []
+faltantes    = []
+frame_actual = None
+frame_count  = 0
+
+# ──────────────────────────────────────────
+# FUNCIONES
+# ──────────────────────────────────────────
+def nuevo_video_writer():
+    ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path   = CARPETA_VIDEO + "/grabacion_" + ts + ".avi"
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    writer = cv2.VideoWriter(path, fourcc, 20.0, (1280, 720))
+    print("  Nueva grabacion iniciada: " + path)
+    return writer, time.time()
+
+def limpiar_grabaciones_viejas():
+    import glob
+    ahora  = time.time()
+    limite = DIAS_RETENCION * 86400
+    for archivo in glob.glob(CARPETA_VIDEO + "/*.avi"):
+        if ahora - os.path.getmtime(archivo) > limite:
+            os.remove(archivo)
+            print("  Grabacion eliminada: " + archivo)
+
+def tomar_screenshot(motivo):
+    ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    nombre = CARPETA_SS + "/alerta_" + motivo + "_" + ts + ".png"
+    if frame_actual is not None:
+        cv2.imwrite(nombre, frame_actual)
+        print("  Screenshot guardado: " + nombre)
+    return nombre
+
+def enviar_mensaje_whatsapp(mensaje):
+    try:
+        url   = GREEN_API_URL + "/sendMessage/" + GREEN_API_TOKEN
+        chat  = TELEFONO + "@c.us"
+        body  = {"chatId": chat, "message": mensaje}
+        print("  Enviando mensaje a: " + chat)
+        print("  URL: " + url)
+        r = requests.post(url, json=body, timeout=10)
+        print("  Status mensaje: " + str(r.status_code))
+        print("  Respuesta: " + r.text)
+        if r.status_code == 200:
+            print("  Mensaje enviado correctamente.")
+        else:
+            print("  Error mensaje: " + str(r.status_code))
+    except Exception as e:
+        print("  Error enviando mensaje: " + str(e))
+
+def enviar_imagen_whatsapp(ruta_imagen, caption=""):
+    try:
+        url  = GREEN_API_URL + "/sendFileByUpload/" + GREEN_API_TOKEN
+        chat = TELEFONO + "@c.us"
+        body = {"chatId": chat, "caption": caption}
+        print("  Enviando imagen: " + ruta_imagen)
+        with open(ruta_imagen, "rb") as f:
+            files = {"file": (os.path.basename(ruta_imagen), f, "image/png")}
+            r = requests.post(url, data=body, files=files, timeout=15)
+        print("  Status imagen: " + str(r.status_code))
+        print("  Respuesta: " + r.text)
+        if r.status_code == 200:
+            print("  Imagen enviada correctamente.")
+        else:
+            print("  Error imagen: " + str(r.status_code))
+    except Exception as e:
+        print("  Error enviando imagen: " + str(e))
+
+def enviar_alerta(mensaje, ruta_imagen):
+    enviar_mensaje_whatsapp(mensaje)
+    time.sleep(3)
+    enviar_imagen_whatsapp(ruta_imagen, "Captura del incidente")
+
+# Umbral de confianza por clase (más bajo = más fácil de detectar)
+CONFIANZA_POR_CLASE = {
+    "hardhat": 0.5,   # Casco detecta bien, umbral normal
+    "gloves":  0.15,  # Guantes detecta menos, umbral más bajo
+    "goggles": 0.15,  # Careta detecta menos, umbral más bajo
+}
+
+def detectar_faltantes(preds):
+    detectados = set()
+    for pred in preds:
+        clase = pred["class"].lower()
+        umbral = CONFIANZA_POR_CLASE.get(clase, 0.3)
+        if pred["confidence"] >= umbral:
+            detectados.add(clase)
+    return [nombre for clave, nombre in EPP_REQUERIDO.items()
+            if clave not in detectados]
+
+def dibujar_ui(frame, preds, faltantes):
+    for pred in preds:
+        if pred["confidence"] < 0.3:
+            continue
+        x = int(pred["x"] - pred["width"]  / 2)
+        y = int(pred["y"] - pred["height"] / 2)
+        w = int(pred["width"])
+        h = int(pred["height"])
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 200, 0), 2)
+        cv2.putText(frame, pred["class"] + " " + str(round(pred["confidence"]*100)) + "%",
+                    (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2)
+
+    fondo_h = len(EPP_REQUERIDO) * 30 + 10
+    cv2.rectangle(frame, (0, 0), (220, fondo_h), (30, 30, 30), -1)
+    for i, (clave, nombre) in enumerate(EPP_REQUERIDO.items()):
+        ok    = nombre not in faltantes
+        color = (0, 220, 0) if ok else (0, 60, 220)
+        icono = "OK" if ok else "!!"
+        cv2.putText(frame, "[" + icono + "] " + nombre,
+                    (8, 25 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+    ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    cv2.putText(frame, ts, (10, frame.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+    if faltantes:
+        h, w = frame.shape[:2]
+        cv2.rectangle(frame, (0, h - 45), (w, h - 25), (0, 0, 180), -1)
+        cv2.putText(frame, "FALTA: " + ", ".join(faltantes),
+                    (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+    return frame
+
+# ──────────────────────────────────────────
+# BUCLE PRINCIPAL
+# ──────────────────────────────────────────
+print("Sistema EPP activo 24/7 - presiona 'q' para salir.")
+print("URL base: " + GREEN_API_URL)
+out, tiempo_inicio_video = nuevo_video_writer()
+limpiar_grabaciones_viejas()
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        print("No se pudo leer frame. Reintentando...")
+        time.sleep(0.5)
+        continue
+
+    frame_count += 1
+    frame_actual = frame.copy()
+
+    if frame_count % 10 == 0:
+        try:
+            temp_path = CARPETA_SS + "/temp_frame.jpg"
+            cv2.imwrite(temp_path, frame)
+            resultado    = CLIENT.infer(temp_path, model_id=MODEL_ID)
+            predicciones = resultado.get("predictions", [])
+            faltantes    = detectar_faltantes(predicciones)
+        except Exception as e:
+            print("  Error API: " + str(e))
+            predicciones = []
+            faltantes    = []
+
+    frame = dibujar_ui(frame, predicciones, faltantes)
+    out.write(frame)
+
+    if time.time() - tiempo_inicio_video >= MINUTOS_POR_VIDEO * 60:
+        out.release()
+        out, tiempo_inicio_video = nuevo_video_writer()
+        limpiar_grabaciones_viejas()
+
+    cv2.imshow("EPP - Camara Laptop", frame)
+
+    if faltantes:
+        clave_alerta = "_".join(sorted(faltantes))
+        ahora        = time.time()
+        if ahora - ultimo_envio.get(clave_alerta, 0) >= COOLDOWN_SEG:
+            ultimo_envio[clave_alerta] = ahora
+            ts      = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            mensaje = (
+                "ALERTA SEGURIDAD - EPP INCOMPLETO\n"
+                "Ubicacion: Camara Laptop\n"
+                "Hora: " + ts + "\n"
+                "Faltante(s): " + ", ".join(faltantes) + "\n"
+                "Por favor equipese antes de continuar."
+            )
+            ruta = tomar_screenshot(clave_alerta)
+            enviar_alerta(mensaje, ruta)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+out.release()
+cv2.destroyAllWindows()
+print("Sistema detenido.")
+===== test_greenapi.py =====
+import requests
+
+GREEN_ID_INSTANCE = "elimnine el id"
+GREEN_API_TOKEN   = "elimine el token"
+TELEFONO          = "Elimine el telefono"
+
+url = "https://7107.api.greenapi.com/waInstance{}/sendMessage/{}".format(
+    GREEN_ID_INSTANCE, GREEN_API_TOKEN
+)
+
+print(f"URL: {url}")
+
+body = {
+    "chatId": "{}@c.us".format(TELEFONO),
+    "message": "Prueba EPP Sistema"
+}
+
+r = requests.post(url, json=body, timeout=10)
+print(f"Status: {r.status_code}")
+print(f"Respuesta: {r.text}")
+===== limpiar_cola.py =====
+# limpiar_cola.py
+import requests
+
+GREEN_ID_INSTANCE = "Eliminada"
+GREEN_API_TOKEN   = "eliminada"
+
+url = "https://7107.api.greenapi.com/waInstance{}/receiveNotification/{}".format(
+    GREEN_ID_INSTANCE, GREEN_API_TOKEN
+)
+
+print("Limpiando cola...")
+for i in range(15):
+    r = requests.get(url, timeout=10)
+    data = r.json()
+    if data is None:
+        print("Cola vacía.")
+        break
+    
+    # Confirmar recepción para eliminarlo de la cola
+    receipt_id = data.get("receiptId")
+    if receipt_id:
+        del_url = "https://7107.api.greenapi.com/waInstance{}/deleteNotification/{}/{}".format(
+            GREEN_ID_INSTANCE, GREEN_API_TOKEN, receipt_id
+        )
+        requests.delete(del_url, timeout=10)
+        print("Mensaje {} eliminado.".format(i+1))
+
+print("Listo. Vuelve a correr el test.")

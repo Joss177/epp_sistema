@@ -1,0 +1,62 @@
+# ============================================================
+# CONFIGURACIÓN - Detección de EPP (modelo local YOLOv8, sin Roboflow)
+# ============================================================
+cameras:
+  - id: "entrada_planta"
+    rtsp_env: "CAM1_RTSP"
+
+  - id: "linea_embotellado"
+    rtsp_env: "CAM2_RTSP"
+
+  - id: "linea_embotellado2"
+    rtsp_env: "CAM3_RTSP"
+
+  # - id: "camara_3"
+  #   rtsp_url: "rtsp://usuario:password@elimine/stream2"
+
+detection:
+  model_path: "models/best.pt"
+  confidence_threshold: 0.4
+  class_confidence:
+    cap: 0.5
+    face_shield_down: 0.4
+    face_shield_up: 0.4
+    gloves: 0.25
+    person: 0.5
+    sleeves: 0.3
+    sleeveless: 0.45
+
+  frame_skip: 1
+  resize_width: 640
+
+  # --- Ventana de decisión (AHORA POR TIEMPO) ---
+  alert_window_seconds: 3.0
+
+  # Mínimo de muestras dentro de la ventana antes de confiar en ella
+  # (evita confirmar con solo 1-2 frames si la red va lenta)
+  min_samples_ventana: 3
+
+  # Proporción de muestras dentro de la ventana que deben mostrar
+  # la misma condición de incumplimiento para confirmarla (0.0 - 1.0)
+  required_violation_ratio: 0.7
+
+  alert_cooldown_seconds: 30
+
+
+greenapi:
+  api_url_env: "GREENAPI_URL"
+  id_instance_env: "GREENAPI_ID_INSTANCE"
+  api_token_instance_env: "GREENAPI_TOKEN"
+  chat_id_env: "GREENAPI_CHAT_ID"
+
+testing:
+  # true  -> NO se envían mensajes reales por WhatsApp; solo se loguea lo que
+  #          se habría mandado. El snapshot y el registro en SQLite sí se
+  #          generan normal, para poder validar todo el flujo.
+  # false -> comportamiento de producción, sí envía por GreenAPI.
+  dry_run: false
+
+storage:
+  # Dónde se guardan las evidencias (fotos) y el registro de eventos
+  snapshots_dir: "data/snapshots"
+  database_path: "data/events.db"

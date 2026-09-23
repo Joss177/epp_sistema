@@ -1,0 +1,95 @@
+# ==========================================
+# DATASETS Y CAPTURAS
+# ==========================================
+
+capturas/
+dataset_capturas_01/
+dataset_capturas_02/
+dataset_capturas_03/
+dataset_capturas_04/
+dataset_capturas_05/
+dataset_capturas_06/
+dataset_capturas_07/
+grabaciones/
+
+# Dataset exportado de Roboflow
+ppe-detector/models/epp-deteccion-v4.v4-dataset03.yolov8/
+
+
+# ==========================================
+# DATOS GENERADOS POR EL SISTEMA
+# ==========================================
+
+ppe-detector/data/events.db
+ppe-detector/data/*.db
+ppe-detector/data/*.sqlite
+ppe-detector/data/*.sqlite3
+
+ppe-detector/data/snapshots/
+
+
+# ==========================================
+# SECRETOS
+# ==========================================
+
+.env
+.env.*
+!.env.example
+
+ppe-detector/.env
+ppe-detector/.env.*
+!ppe-detector/.env.example
+
+
+# ==========================================
+# PYTHON
+# ==========================================
+
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+env/
+
+
+# ==========================================
+# LOGS
+# ==========================================
+
+*.log
+logs/
+
+
+# ==========================================
+# IDE
+# ==========================================
+
+.vscode/
+.idea/
+
+
+# ==========================================
+# SISTEMA OPERATIVO
+# ==========================================
+
+Thumbs.db
+.DS_Store
+
+# Modelos y datasets
+*.zip
+*.pt
+*.pth
+*.onnx
+*.weights
+*.h5
+
+# Grabaciones de cámaras
+grabaciones/
+*.avi
+*.mp4
+*.mkv
+
+# Datos generados
+data/events.db
+data/snapshots/
