@@ -8,7 +8,8 @@ GREEN_ID_INSTANCE = os.getenv("GREENAPI_ID_INSTANCE")
 GREEN_API_TOKEN = os.getenv("GREENAPI_TOKEN")
 
 TELEFONOS = [
-    os.getenv("GREENAPI_CHAT_ID").replace("@c.us", "")
+    os.getenv("GREENAPI_CHAT_ID").replace("@c.us", ""),
+    os.getenv("GREENAPI_CHAT_ID_2").replace("@c.us", "")
 ]
 
 url = "https://7107.api.greenapi.com/waInstance{}/sendMessage/{}".format(

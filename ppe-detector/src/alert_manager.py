@@ -25,10 +25,13 @@ import time
 import os
 import logging
 
+from dotenv import load_dotenv
 from datetime import datetime
 
 
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 
 class AlertManager:
@@ -41,21 +44,22 @@ class AlertManager:
         dry_run: bool = False,
     ):
 
-        self.id_instance = greenapi_config[
-            "id_instance"
+        self.id_instance = os.getenv(
+            greenapi_config["id_instance_env"]
+        )
+
+        self.api_token = os.getenv(
+            greenapi_config["api_token_instance_env"]
+        )
+
+        self.chat_ids = [
+            os.getenv(env_name)
+            for env_name in greenapi_config["chat_id_envs"]
+            if os.getenv(env_name)
         ]
 
-        self.api_token = greenapi_config[
-            "api_token_instance"
-        ]
-
-        self.chat_id = greenapi_config[
-            "chat_id"
-        ]
-
-        self.api_url = greenapi_config.get(
-            "api_url",
-            "https://api.greenapi.com",
+        self.api_url = os.getenv(
+            greenapi_config["api_url_env"]
         )
 
         self.snapshots_dir = storage_config[
@@ -80,6 +84,7 @@ class AlertManager:
         )
 
         if database_dir:
+
             os.makedirs(
                 database_dir,
                 exist_ok=True,
@@ -250,7 +255,7 @@ class AlertManager:
         conn.close()
 
     # =========================================================
-    # WHATSAPP - CON IMAGEN (alertas de EPP)
+    # WHATSAPP - CON IMAGEN
     # =========================================================
 
     def _enviar_whatsapp(
@@ -276,51 +281,55 @@ class AlertManager:
             f"{self.api_token}"
         )
 
-        with open(
-            snapshot_path,
-            "rb",
-        ) as file:
+        for chat_id in self.chat_ids:
 
-            files = {
-                "file": (
-                    os.path.basename(
-                        snapshot_path
-                    ),
-                    file,
-                    "image/jpeg",
-                )
-            }
+            with open(
+                snapshot_path,
+                "rb",
+            ) as file:
 
-            data = {
-                "chatId": self.chat_id,
-                "caption": mensaje,
-            }
+                files = {
+                    "file": (
+                        os.path.basename(
+                            snapshot_path
+                        ),
+                        file,
+                        "image/jpeg",
+                    )
+                }
 
-            try:
+                data = {
+                    "chatId": chat_id,
+                    "caption": mensaje,
+                }
 
-                response = requests.post(
-                    url,
-                    data=data,
-                    files=files,
-                    timeout=15,
-                )
+                try:
 
-                response.raise_for_status()
+                    response = requests.post(
+                        url,
+                        data=data,
+                        files=files,
+                        timeout=15,
+                    )
 
-                logger.info(
-                    f"Alerta enviada por WhatsApp: "
-                    f"{response.status_code}"
-                )
+                    response.raise_for_status()
 
-            except requests.RequestException as error:
+                    logger.info(
+                        f"Alerta enviada por WhatsApp a "
+                        f"{chat_id}: "
+                        f"{response.status_code}"
+                    )
 
-                logger.error(
-                    f"Error enviando alerta: "
-                    f"{error}"
-                )
+                except requests.RequestException as error:
+
+                    logger.error(
+                        f"Error enviando alerta a "
+                        f"{chat_id}: "
+                        f"{error}"
+                    )
 
     # =========================================================
-    # WHATSAPP - SOLO TEXTO (notificaciones de sistema)
+    # WHATSAPP - SOLO TEXTO
     # =========================================================
 
     def _enviar_whatsapp_texto(
@@ -344,32 +353,36 @@ class AlertManager:
             f"{self.api_token}"
         )
 
-        data = {
-            "chatId": self.chat_id,
-            "message": mensaje,
-        }
+        for chat_id in self.chat_ids:
 
-        try:
+            data = {
+                "chatId": chat_id,
+                "message": mensaje,
+            }
 
-            response = requests.post(
-                url,
-                json=data,
-                timeout=15,
-            )
+            try:
 
-            response.raise_for_status()
+                response = requests.post(
+                    url,
+                    json=data,
+                    timeout=15,
+                )
 
-            logger.info(
-                f"Notificación de sistema enviada: "
-                f"{response.status_code}"
-            )
+                response.raise_for_status()
 
-        except requests.RequestException as error:
+                logger.info(
+                    f"Notificación de sistema enviada a "
+                    f"{chat_id}: "
+                    f"{response.status_code}"
+                )
 
-            logger.error(
-                f"Error enviando notificación de sistema: "
-                f"{error}"
-            )
+            except requests.RequestException as error:
+
+                logger.error(
+                    f"Error enviando notificación de sistema a "
+                    f"{chat_id}: "
+                    f"{error}"
+                )
 
     # =========================================================
     # ALERTA REAL (EPP)

@@ -47,7 +47,9 @@ greenapi:
   api_url_env: "GREENAPI_URL"
   id_instance_env: "GREENAPI_ID_INSTANCE"
   api_token_instance_env: "GREENAPI_TOKEN"
-  chat_id_env: "GREENAPI_CHAT_ID"
+  chat_id_envs:
+    - "GREENAPI_CHAT_ID"
+    - "GREENAPI_CHAT_ID_2"
 
 testing:
   # true  -> NO se envían mensajes reales por WhatsApp; solo se loguea lo que

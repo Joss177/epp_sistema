@@ -39,7 +39,11 @@ import yaml
 import time
 import signal
 import logging
+import os
+from dotenv import load_dotenv
 from collections import defaultdict, deque
+
+load_dotenv()
 
 from camera_stream import CameraStream
 from ppe_detector import PPEDetector
@@ -84,9 +88,17 @@ def main():
 
         camera_id = camera_config["id"]
 
+        rtsp_env = camera_config["rtsp_env"]
+        rtsp_url = os.getenv(rtsp_env)
+
+        if not rtsp_url:
+            raise ValueError(
+                "No se encontró la variable de entorno: {}".format(rtsp_env)
+            )
+
         stream = CameraStream(
             camera_id,
-            camera_config["rtsp_url"],
+            rtsp_url,
         ).start()
 
         streams[camera_id] = stream
