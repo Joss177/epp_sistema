@@ -224,6 +224,8 @@ def main():
 
     historial = defaultdict(deque)
 
+    ultimo_estado_confirmado = defaultdict(lambda: None)
+
     logger.info(
         "Sistema iniciado."
     )
@@ -300,6 +302,8 @@ def main():
                     historial[
                         camera_id
                     ].clear()
+
+                    ultimo_estado_confirmado[camera_id] = None 
 
                     continue
 
@@ -419,6 +423,24 @@ def main():
                 )
 
                 # -------------------------------------------------
+                # CUMPLIMIENTO CONFIRMADO (solo en la transición)
+                # -------------------------------------------------
+
+                if estado_final == "cumple":
+
+                    if ultimo_estado_confirmado[camera_id] != "cumple":
+
+                        alert_manager.registrar_cumplimiento_confirmado(
+                            camera_id
+                        )
+
+                    ultimo_estado_confirmado[camera_id] = "cumple"
+
+                elif estado_final == "dudoso":
+
+                    ultimo_estado_confirmado[camera_id] = "dudoso"
+
+                # -------------------------------------------------
                 # ALERTA
                 # -------------------------------------------------
 
@@ -438,6 +460,8 @@ def main():
                         incumplimientos_confirmados,
                         frame,
                     )
+
+                    ultimo_estado_confirmado[camera_id] = "incumplimiento"
 
                     # Después de una alerta empezamos
                     # una ventana nueva.

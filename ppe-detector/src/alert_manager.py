@@ -388,6 +388,21 @@ class AlertManager:
     # ALERTA REAL (EPP)
     # =========================================================
 
+    def registrar_cumplimiento_confirmado(self, camera_id: str):
+        """
+        Registra un evento de cumplimiento confirmado por la ventana
+        de tiempo. No envía WhatsApp ni aplica cooldown — es_alerta=True
+        aquí significa "evento confirmado/deduplicado para reportes",
+        no "notificación enviada".
+        """
+        self._registrar_evento(
+            camera_id=camera_id,
+            epp_detectado=["cumple"],
+            snapshot_path=None,
+            estado="cumple",
+            es_alerta=True,
+    )
+
     def procesar_incumplimiento(
         self,
         camera_id: str,
