@@ -19,18 +19,32 @@ Estados de cumplimiento por frame:
   INCUMPLIMIENTO:
       person + sleeveless
       person + face_shield_up
-      person + cap sin face_shield_down
 
   DUDOSO:
-      persona detectada pero no existe suficiente evidencia
-      para confirmar cumplimiento o incumplimiento.
+      persona detectada pero existe información contradictoria
+      o insuficiente para confirmar cumplimiento/incumplimiento.
 
-La decisión final de alerta mediante varios frames se realiza
-en main.py. Este módulo solamente detecta y evalúa cada frame.
+IMPORTANTE:
+
+  Si en el mismo frame aparecen:
+
+      face_shield_down
+      face_shield_up
+
+  se considera un CONFLICTO y NO se genera directamente
+  un incumplimiento por careta levantada.
+
+  Esto evita que una falsa detección de face_shield_up
+  convierta automáticamente una persona correctamente
+  protegida en una alerta.
+
+La decisión final de alerta mediante varios frames
+se realiza en main.py.
 """
 
 from ultralytics import YOLO
 import logging
+
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +252,8 @@ class PPEDetector:
         {
             "estado": "cumple" | "dudoso" | "incumplimiento",
             "incumplimientos": [...],
-            "clases": [...]
+            "clases": [...],
+            "conflicto_careta": bool
         }
 
         ----------------------------------------------------------
@@ -255,14 +270,22 @@ class PPEDetector:
 
         person + face_shield_up
 
-        person + cap sin face_shield_down
+        PERO:
+
+        Si existen simultáneamente:
+
+            face_shield_down
+            face_shield_up
+
+        se considera un conflicto y la careta NO genera
+        directamente un incumplimiento.
 
         ----------------------------------------------------------
         DUDOSO
         ----------------------------------------------------------
 
         Persona detectada, pero no hay suficiente información
-        para confirmar cumplimiento o incumplimiento.
+        o existe información contradictoria.
         """
 
         # --------------------------------------------------------
@@ -282,6 +305,7 @@ class PPEDetector:
             "estado": "dudoso",
             "incumplimientos": [],
             "clases": sorted(clases),
+            "conflicto_careta": False,
         }
 
         # --------------------------------------------------------
@@ -290,6 +314,28 @@ class PPEDetector:
 
         if "persona" not in clases:
             return resultado
+
+        # --------------------------------------------------------
+        # Detectar conflicto entre careta abajo y arriba
+        # --------------------------------------------------------
+
+        careta_abajo = (
+            "careta_abajo" in clases
+        )
+
+        careta_arriba = (
+            "careta_arriba" in clases
+        )
+
+        conflicto_careta = (
+            careta_abajo
+            and
+            careta_arriba
+        )
+
+        resultado[
+            "conflicto_careta"
+        ] = conflicto_careta
 
         incumplimientos = []
 
@@ -306,26 +352,39 @@ class PPEDetector:
         # ========================================================
         # 2. CARETA LEVANTADA
         # ========================================================
+        #
+        # IMPORTANTE:
+        #
+        # Si también existe careta_abajo, no confiamos en
+        # careta_arriba porque existe una contradicción.
+        #
+        # El caso se marcará como DUDOSO si no existe otra
+        # condición independiente de incumplimiento.
+        # ========================================================
 
-        if "careta_arriba" in clases:
+        if (
+            careta_arriba
+            and
+            not careta_abajo
+        ):
 
             incumplimientos.append(
                 "careta levantada"
             )
 
         # ========================================================
-        # 3. GORRA SIN CARETA ABAJO
+        # 3. NO SE USA:
+        #
+        # casco + ausencia de careta_abajo
+        #
+        # Esta regla fue eliminada intencionalmente.
+        #
+        # No detectar face_shield_down NO significa que la
+        # persona no tenga careta.
+        #
+        # Esto es especialmente importante para los cascos
+        # blancos y las caretas transparentes.
         # ========================================================
-
-        if (
-            "casco" in clases
-            and
-            "careta_abajo" not in clases
-        ):
-
-            incumplimientos.append(
-                "falta de careta"
-            )
 
         # --------------------------------------------------------
         # Eliminar duplicados conservando el orden
@@ -354,13 +413,29 @@ class PPEDetector:
             return resultado
 
         # ========================================================
-        # CUMPLE
+        # CONFLICTO DE CARETA
+        # ========================================================
+        #
+        # Si hay down + up, no decimos que cumple ni que
+        # incumple. Lo dejamos como dudoso.
+        # ========================================================
+
+        if conflicto_careta:
+
+            resultado[
+                "estado"
+            ] = "dudoso"
+
+            return resultado
+
+        # ========================================================
+        # CUMPLIMIENTO
         # ========================================================
 
         if (
             "mangas" in clases
             and
-            "careta_abajo" in clases
+            careta_abajo
         ):
 
             resultado[
