@@ -40,7 +40,7 @@ detection:
   # la misma condición de incumplimiento para confirmarla (0.0 - 1.0)
   required_violation_ratio: 0.7
 
-  alert_cooldown_seconds: 120
+  alert_cooldown_seconds: 60
 
 
 greenapi:
