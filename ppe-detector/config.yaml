@@ -32,7 +32,7 @@ detection:
   # --- Ventana de decisión (AHORA POR TIEMPO) ---
   alert_window_seconds: 5.0
 
-  # Mínimo de muestras dentro de la ventana antes de confiar en ella
+  # Minimo de muestras den tro de la vetana antes de confiar en ella
   # (evita confirmar con solo 1-2 frames si la red va lenta)
   min_samples_ventana: 3
 
@@ -44,12 +44,24 @@ detection:
 
 
 greenapi:
-  api_url_env: "GREENAPI_URL"
-  id_instance_env: "GREENAPI_ID_INSTANCE"
-  api_token_instance_env: "GREENAPI_TOKEN"
-  chat_id_envs:
-    - "GREENAPI_CHAT_ID"
-    - "GREENAPI_CHAT_ID_2"
+  # Cada instancia es un número/cuenta de WhatsApp distinto en GreenAPI,
+  # con su propio ID, token y lista de chats destino.
+  instances:
+    - name: "instancia_1"
+      api_url_env: "GREENAPI_URL"
+      id_instance_env: "GREENAPI_ID_INSTANCE"
+      api_token_instance_env: "GREENAPI_TOKEN"
+      chat_id_envs:
+        - "GREENAPI_CHAT_ID"
+        - "GREENAPI_CHAT_ID_2"
+
+    - name: "instancia_2"
+      api_url_env: "GREENAPI_URL_2"
+      id_instance_env: "GREENAPI_ID_INSTANCE_2"
+      api_token_instance_env: "GREENAPI_TOKEN_2"
+      chat_id_envs:
+        - "GREENAPI_CHAT_ID_3"
+        - "GREENAPI_CHAT_ID_4"
 
 testing:
   # true  -> NO se envían mensajes reales por WhatsApp; solo se loguea lo que
