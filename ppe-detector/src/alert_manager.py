@@ -6,7 +6,7 @@ Responsabilidades:
 - Cooldown independiente por cámara.
 - Guardado de evidencia.
 - Registro SQLite.
-- Envío por GreenAPI.
+- Envío por GreenAPI (una o varias instancias).
 - Registro de estados:
     cumple
     dudoso
@@ -16,6 +16,21 @@ Responsabilidades:
 
 dry_run=True:
     no envía WhatsApp real.
+
+Configuración GreenAPI soportada (config.yaml):
+
+    greenapi:
+      instances:
+        - name: "instancia_1"
+          api_url_env: "GREENAPI_URL"
+          id_instance_env: "GREENAPI_ID_INSTANCE"
+          api_token_instance_env: "GREENAPI_TOKEN"
+          chat_id_envs: ["GREENAPI_CHAT_ID", "GREENAPI_CHAT_ID_2"]
+        - name: "instancia_2"
+          ...
+
+    También sigue funcionando el formato anterior (una sola instancia,
+    con las llaves directamente bajo "greenapi").
 """
 
 import cv2
@@ -44,23 +59,19 @@ class AlertManager:
         dry_run: bool = False,
     ):
 
-        self.id_instance = os.getenv(
-            greenapi_config["id_instance_env"]
+        self.dry_run = dry_run
+
+        self.instances = self._cargar_instancias(
+            greenapi_config
         )
 
-        self.api_token = os.getenv(
-            greenapi_config["api_token_instance_env"]
-        )
+        if not self.instances and not self.dry_run:
 
-        self.chat_ids = [
-            os.getenv(env_name)
-            for env_name in greenapi_config["chat_id_envs"]
-            if os.getenv(env_name)
-        ]
-
-        self.api_url = os.getenv(
-            greenapi_config["api_url_env"]
-        )
+            logger.error(
+                "No hay ninguna instancia de GreenAPI "
+                "con credenciales y chats validos. "
+                "No se enviaran mensajes."
+            )
 
         self.snapshots_dir = storage_config[
             "snapshots_dir"
@@ -71,8 +82,6 @@ class AlertManager:
         ]
 
         self.cooldown_seconds = cooldown_seconds
-
-        self.dry_run = dry_run
 
         os.makedirs(
             self.snapshots_dir,
@@ -100,6 +109,76 @@ class AlertManager:
                 "AlertManager en DRY_RUN. "
                 "No se enviaran mensajes reales."
             )
+
+    # =========================================================
+    # INSTANCIAS GREENAPI
+    # =========================================================
+
+    @staticmethod
+    def _cargar_instancias(greenapi_config) -> list:
+        """
+        Devuelve una lista de instancias normalizadas:
+        [{name, api_url, id_instance, api_token, chat_ids}, ...]
+
+        Acepta el formato nuevo (lista "instances") y el viejo
+        (una sola instancia directamente bajo "greenapi").
+        """
+
+        if "instances" in greenapi_config:
+            raw_instances = greenapi_config["instances"] or []
+        else:
+            raw_instances = [greenapi_config]
+
+        instancias = []
+
+        for idx, raw in enumerate(raw_instances, start=1):
+
+            name = raw.get("name", f"instancia_{idx}")
+
+            api_url = os.getenv(raw["api_url_env"])
+            id_instance = os.getenv(raw["id_instance_env"])
+            api_token = os.getenv(raw["api_token_instance_env"])
+
+            chat_ids = [
+                os.getenv(env_name)
+                for env_name in raw.get("chat_id_envs", [])
+                if os.getenv(env_name)
+            ]
+
+            if not (api_url and id_instance and api_token):
+
+                logger.error(
+                    f"[{name}] Faltan variables de entorno "
+                    f"(URL, ID o TOKEN). Instancia omitida."
+                )
+
+                continue
+
+            if not chat_ids:
+
+                logger.warning(
+                    f"[{name}] No tiene chat_ids validos. "
+                    f"Instancia omitida."
+                )
+
+                continue
+
+            instancias.append(
+                {
+                    "name": name,
+                    "api_url": api_url,
+                    "id_instance": id_instance,
+                    "api_token": api_token,
+                    "chat_ids": chat_ids,
+                }
+            )
+
+            logger.info(
+                f"[{name}] Instancia GreenAPI cargada "
+                f"con {len(chat_ids)} chat(s)."
+            )
+
+        return instancias
 
     # =========================================================
     # BASE DE DATOS
@@ -269,63 +348,71 @@ class AlertManager:
             logger.info(
                 f"[DRY_RUN] WhatsApp:\n"
                 f"{mensaje}\n"
-                f"Snapshot: {snapshot_path}"
+                f"Snapshot: {snapshot_path}\n"
+                f"Instancias: "
+                f"{[i['name'] for i in self.instances]}"
             )
 
             return
 
-        url = (
-            f"{self.api_url}"
-            f"/waInstance{self.id_instance}"
-            f"/sendFileByUpload/"
-            f"{self.api_token}"
-        )
+        for instance in self.instances:
 
-        for chat_id in self.chat_ids:
+            url = (
+                f"{instance['api_url']}"
+                f"/waInstance{instance['id_instance']}"
+                f"/sendFileByUpload/"
+                f"{instance['api_token']}"
+            )
 
-            with open(
-                snapshot_path,
-                "rb",
-            ) as file:
-
-                files = {
-                    "file": (
-                        os.path.basename(
-                            snapshot_path
-                        ),
-                        file,
-                        "image/jpeg",
-                    )
-                }
-
-                data = {
-                    "chatId": chat_id,
-                    "caption": mensaje,
-                }
+            for chat_id in instance["chat_ids"]:
 
                 try:
 
-                    response = requests.post(
-                        url,
-                        data=data,
-                        files=files,
-                        timeout=15,
-                    )
+                    with open(
+                        snapshot_path,
+                        "rb",
+                    ) as file:
+
+                        files = {
+                            "file": (
+                                os.path.basename(
+                                    snapshot_path
+                                ),
+                                file,
+                                "image/jpeg",
+                            )
+                        }
+
+                        data = {
+                            "chatId": chat_id,
+                            "caption": mensaje,
+                        }
+
+                        response = requests.post(
+                            url,
+                            data=data,
+                            files=files,
+                            timeout=15,
+                        )
 
                     response.raise_for_status()
 
                     logger.info(
-                        f"Alerta enviada por WhatsApp a "
-                        f"{chat_id}: "
+                        f"[{instance['name']}] Alerta enviada "
+                        f"por WhatsApp a {chat_id}: "
                         f"{response.status_code}"
                     )
 
-                except requests.RequestException as error:
+                except (
+                    requests.RequestException,
+                    OSError,
+                ) as error:
 
+                    # Si una instancia o chat falla, se sigue
+                    # con las demas.
                     logger.error(
-                        f"Error enviando alerta a "
-                        f"{chat_id}: "
-                        f"{error}"
+                        f"[{instance['name']}] Error enviando "
+                        f"alerta a {chat_id}: {error}"
                     )
 
     # =========================================================
@@ -341,48 +428,52 @@ class AlertManager:
 
             logger.info(
                 f"[DRY_RUN] WhatsApp (texto):\n"
-                f"{mensaje}"
+                f"{mensaje}\n"
+                f"Instancias: "
+                f"{[i['name'] for i in self.instances]}"
             )
 
             return
 
-        url = (
-            f"{self.api_url}"
-            f"/waInstance{self.id_instance}"
-            f"/sendMessage/"
-            f"{self.api_token}"
-        )
+        for instance in self.instances:
 
-        for chat_id in self.chat_ids:
+            url = (
+                f"{instance['api_url']}"
+                f"/waInstance{instance['id_instance']}"
+                f"/sendMessage/"
+                f"{instance['api_token']}"
+            )
 
-            data = {
-                "chatId": chat_id,
-                "message": mensaje,
-            }
+            for chat_id in instance["chat_ids"]:
 
-            try:
+                data = {
+                    "chatId": chat_id,
+                    "message": mensaje,
+                }
 
-                response = requests.post(
-                    url,
-                    json=data,
-                    timeout=15,
-                )
+                try:
 
-                response.raise_for_status()
+                    response = requests.post(
+                        url,
+                        json=data,
+                        timeout=15,
+                    )
 
-                logger.info(
-                    f"Notificación de sistema enviada a "
-                    f"{chat_id}: "
-                    f"{response.status_code}"
-                )
+                    response.raise_for_status()
 
-            except requests.RequestException as error:
+                    logger.info(
+                        f"[{instance['name']}] Notificación de "
+                        f"sistema enviada a {chat_id}: "
+                        f"{response.status_code}"
+                    )
 
-                logger.error(
-                    f"Error enviando notificación de sistema a "
-                    f"{chat_id}: "
-                    f"{error}"
-                )
+                except requests.RequestException as error:
+
+                    logger.error(
+                        f"[{instance['name']}] Error enviando "
+                        f"notificación de sistema a {chat_id}: "
+                        f"{error}"
+                    )
 
     # =========================================================
     # ALERTA REAL (EPP)
@@ -401,7 +492,7 @@ class AlertManager:
             snapshot_path=None,
             estado="cumple",
             es_alerta=True,
-    )
+        )
 
     def procesar_incumplimiento(
         self,
